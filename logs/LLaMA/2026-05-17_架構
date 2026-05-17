@@ -37,6 +37,34 @@ PxV Stage:
 ---
 
 ## 數據
+## Cross-Task Validation
+
+### Multiple Choice (TinyLlama-1.1B, lm-eval-harness acc_norm)
+
+| Task | Samples | Baseline | RAD+PxV | Drop |
+|------|---------|----------|---------|------|
+| HellaSwag | 10042 | 59.58% | 58.27% | 1.31 pp |
+| ARC-Easy | 570 | 50.18% | 49.65% | 0.53 pp |
+| ARC-Challenge | 299 | 31.10% | 29.43% | 1.67 pp |
+| PIQA | 1838 | 74.48% | 73.94% | 0.54 pp |
+| Winogrande | 1267 | 57.30% | 55.41% | 1.89 pp |
+
+跨 5 task drop 範圍 0.53 ~ 1.89 pp, 平均 1.19 pp。
+
+### Language Modeling Perplexity
+
+| Task | Windows | Baseline PPL | RAD+PxV PPL | Relative Δ |
+|------|---------|-------------|-------------|-----------|
+| WikiText-2 (sliding window 512/256) | 1160 | 8.508 | 8.691 | +2.15% |
+
+### Cross-task 結論
+
+機制跨 task type 穩定:
+- Commonsense (HellaSwag, Winogrande, PIQA): 0.54 ~ 1.89 pp drop
+- Science (ARC-Easy, ARC-Challenge): 0.53 ~ 1.67 pp drop
+- Language modeling (WikiText-2): +2.15% relative PPL
+
+無 catastrophic failure。MAC saving 49.52% 跨 task 保持不變 (機制與 task 無關)。
 
 ### Accuracy (10042 sample HellaSwag, acc_norm)
 
