@@ -1,0 +1,164 @@
+# Transformer Attention Accelerator 研究日誌
+
+**Target**: Xilinx KV260 FPGA (117K LUT, 1248 DSP, 4GB DDR4)
+**Benchmark**: TinyLlama-1.1B-Chat-v1.0 on HellaSwag full validation (10042 samples)
+**Evaluation**: lm-evaluation-harness acc_norm (byte-length normalized)
+
+---
+
+## 目前架構
+
+### 主機制: RAD-Cascade with PxV Mixed Precision
+
+**Layer 0 (異質管線)**: 跑滿 64 dim, 8-bit 全精度 Q·K, 8-bit P·V
+
+**Layer 1-21 (RAD-Cascade)**:
+
+Stage 1 — Active + SIGN Compensation:
+- Active dim: 24 (8-bit Q·K MAC)
+  - 2 static Q-anchor pair (offline calibration, |Q|.mean top-2)
+  - 1 static K-anchor pair (offline calibration K-max)
+  - 9 dynamic pair (per-query top-9 by |Q| magnitude)
+- Compensation dim: 40 (1-bit SIGN, β=0.5)
+  - score += β × mean(|K_drop|) × Σ(|Q_drop| × sign(Q_drop) XNOR sign(K_drop))
+
+Stage 2 — Block Adaptive Dispatch:
+- Block size: 16 token
+- Bypass: margin > signal_amp × 0.75 → 只送 top-1
+- Overflow: 不滿足 → 送 score ≥ block_max - signal_amp × 0.25 的 token (≤ 3 per block)
+- 候選 token 補算 40 dropped dim 滿血 8-bit
+
+PxV Stage:
+- P_THRES = 0.05
+- attn_high (prob > 0.05): V 用 8-bit
+- attn_low (prob ≤ 0.05): V 用 per-head 4-bit RTN 假量化
+- 分配律: Out = attn_high @ V_8bit + attn_low @ V_4bit
+
+---
+
+## 數據
+
+### Accuracy (10042 sample HellaSwag, acc_norm)
+
+| Config | acc_norm | Drop |
+|--------|---------|------|
+| Baseline FP32 | 59.58% | - |
+| RAD only | 58.46% | 1.12 pp |
+| RAD + PxV 4-bit | 58.27% | 1.31 pp |
+
+### MAC Saving (real end-to-end, causal triangular)
+
+| Mechanism | Saving |
+|-----------|--------|
+| RAD-Cascade Q·K | 53.25% |
+| PxV P·V | 45.79% |
+| **Total Attention** | **49.52%** |
+
+### Token 分佈
+- High prob (> 0.05) token: 4.1%
+- Low prob (≤ 0.05) token: 95.9%
+
+---
+
+## 已驗證的設計選擇
+
+### Active dim sweep (Spearman ρ ≥ 0.90 門檻, 5 層代表)
+
+| Layer | min ratio (RAD 完整機制) |
+|-------|-------------------------|
+| 0 | 25.0% |
+| 5 | 31.2% |
+| 10 | 25.0% |
+| 15 | 25.0% |
+| 21 | 31.2% |
+
+跨層跨度 6.2pp。**Per-layer adaptive dim 對 TinyLlama 沒實質效益**。
+
+### Active dim ablation (full 10042 sample)
+
+| Config | Drop | MAC saving |
+|--------|------|----------|
+| 24-dim (37.5%) | 1.12 pp | 53.25% |
+| 16-dim (25.0%) | 2.87 pp | 63.93% |
+
+線性 trade-off, 24-dim 是 publication sweet spot, 16-dim 為 aggressive deployment 選項。
+
+### 雙錨點 (2Q+1K) vs 3Q (single-head metric)
+
+| Layer | 3Q worst | 2Q+1K worst | 改善 | 3Q miss>64 | 2Q+1K miss>64 |
+|-------|---------|------------|------|-----------|--------------|
+| 0 | 40.4% | 43.2% | +2.8pp | 7.0% | 5.0% |
+| 5 | 73.8% | 79.2% | +5.4pp | 0.2% | 0.4% |
+| 10 | 61.1% | 68.7% | +7.6pp | 1.7% | 0.1% |
+| 15 | 51.6% | 67.2% | +15.6pp | 3.8% | 0.2% |
+| 21 | 61.2% | 63.6% | +2.4pp | 0.8% | 0.3% |
+
+(A) Calibration-set K-max vs (B) Per-sequence K-max 結果完全一致, 確認 LLaMA outlier dim **位置跨 sample 穩定**。
+
+### PxV variant 對比 (10042 sample)
+
+| Config | Drop | V MAC saving |
+|--------|------|------------|
+| RAD only (no PxV) | 1.12 pp | 0% |
+| PxV 4-bit @ 0.05 | 1.31 pp | 45.79% |
+| PxV Skip @ 0.05 | 8.30 pp | 90.79% |
+
+Skip 不可行 (drop 8.30pp 不可接受)。**4-bit RTN 量化 是 sweet spot**。
+
+### Active dim Stage 1 機制驗證
+
+| Layer | 純 active 25% (Spearman) | active 25% + SIGN comp (Spearman) | 提升 |
+|-------|--------------------------|-------------------------------------|------|
+| 0 | 0.74 | 0.91 | +0.17 |
+| 5 | 0.77 | 0.89 | +0.12 |
+| 10 | 0.79 | 0.90 | +0.11 |
+| 15 | 0.82 | 0.91 | +0.09 |
+| 21 | 0.72 | 0.88 | +0.16 |
+
+1-bit SIGN compensation 平均把 Spearman ρ 提升 0.13。**SIGN compensation 是真實有效, 不是裝飾**。
+
+---
+
+## 失敗方向 (已系統性驗證, 不再嘗試)
+
+1. **Per-pair dim masking** (Layer 3 BERT): Top-1 從 100% → 63% (partial sum 量綱不一致)
+2. **Poison + Antidote bucketing** (BERT): 2-bit BUI 寬度 ≈ 516,000 vs score 範圍 140, 機制 collapse
+3. **Delta encoding 跨 query 共享** (BERT): \|ΔQ\|/\|Q\| ≈ 1, LayerNorm 打散 Q, 無稀疏可循
+4. **INT4 probs 量化** (BERT): drop 1.80pp, INT5 沒 DSP packing 優勢
+5. **Per-pair signed sum 校準** (BERT Layer 3): Top-1 從 99.96% 掉到 25-52%, 量綱校準無物理意義
+6. **Q-driven only masking** (BERT Layer 3): 同等 Top-1 下 dim_kept 78% (比 per-query union 的 40% 差)
+7. **Outlier dim backbone** (TinyLlama): Layer 0/10/21 top-15 dim Top-1 match 38-55% (不主導)
+8. **Outlier detection fallback** (TinyLlama): α=0.5 救回率 35% 對應觸發率 30%, 等同擴大 stage 2
+9. **PxV Skip low prob token**: drop 8.30pp (200 sample noise 內看似可行, 10042 才暴露)
+
+---
+
+## 已驗證的跨架構性質
+
+- BERT-Base MNLI 1000 sample v6: drop -0.10pp, MAC saving 49-56%
+- TinyLlama HellaSwag 10042 RAD+PxV: drop 1.31pp, MAC saving 49.52%
+- LLaMA outlier dim 位置跨 sample 穩定 ((A) cal vs (B) per-seq 完全一致)
+- LLaMA outlier dim dominance 跨層不穩定 (Layer 5 top-15 dim 主導 91.5%, Layer 0/21 38-46%)
+
+---
+
+## 工具基礎建設
+
+- GPU simulator (PyTorch batch): 548x speedup vs numpy per-head loop
+- Per-sample 0.3 秒 (RAD), 10042 sample 53 分鐘
+- Checkpoint + Drive 持久化, 斷線可恢復
+
+---
+
+## 硬體設計關鍵參數
+
+- HEAD_DIM = 64
+- NUM_PAIRS = 32 (每 pair 2 dim)
+- STATIC_Q_PAIRS = 2, STATIC_K_PAIRS = 1, DYNAMIC_PAIRS = 9 (24-dim config)
+- BLOCK_SIZE = 16
+- MAX_LOCAL_TOKENS = 3 (per block stage 2 max)
+- BETA = 0.5 (SIGN compensation 權重)
+- P_THRES = 0.05 (PxV 分流門檻)
+- 4-bit V 量化: per-head min/max RTN, 15 levels
+
+異質管線: Layer 0 跑滿 64 dim (per-head average top-1/median = 4.23x, attention pattern 最分散)。
