@@ -37,6 +37,8 @@
 | offline K-anchor (1Q+1K) | 58.54% | 1.04 pp |
 | EMA α=0.1 (1Q+1K) | 58.41% | 1.17 pp |
 | 0Q+0K (SparQ-style, no anchor) | 55.21% | 4.37 pp |
+| KIVI only (no RAD) | 59.58% | 0.00 |
+| ppRAD only (no KIVI) |58.67% | 0.91 pp |
 
 ## 4. Component contribution (1Q+1K + runtime_max + KIVI base)
 
