@@ -1,9 +1,7 @@
 # TinyLlama-1.1B-Chat-v1.0 — Calibration 數據附錄 (v6)
 
-⚠ TinyLlama-specific 實驗數據, RTL 不寫死, deployment 時 calibration flow 重新生成 register。
-⚠ v6 機制: RAD-Cascade (active dim + SIGN + Global Top-N) + KIVI-V + CETT FFN; AWQ INT4 premise。
-舊 v4 機制 (Block dispatch / M_local / T_margin / gate-proxy FFN) 已淘汰, 本檔刪除其數據, 僅保留仍成立之結論。
-
+TinyLlama-specific 實驗數據
+v6 機制: RAD-Cascade (active dim + SIGN + Global Top-N) + KIVI-V + CETT FFN; AWQ INT4 premise。
 ## 1. Architecture
 
 | 項目 | 值 |
