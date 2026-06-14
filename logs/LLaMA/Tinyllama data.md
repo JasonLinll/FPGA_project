@@ -1,7 +1,9 @@
 # TinyLlama-1.1B-Chat-v1.0 — Calibration 數據附錄 (v6)
 
-TinyLlama-specific 實驗數據
-v6 機制: RAD-Cascade (active dim + SIGN + Global Top-N) + KIVI-V + CETT FFN; AWQ INT4 premise。
+⚠ TinyLlama-specific 實驗數據, RTL 不寫死, deployment 時 calibration flow 重新生成 register。
+⚠ v6 機制: RAD-Cascade (active dim + SIGN + Global Top-N) + KIVI-V + CETT FFN; AWQ INT4 premise。
+舊 v4 機制 (Block dispatch / M_local / T_margin / gate-proxy FFN) 已淘汰, 本檔刪除其數據, 僅保留仍成立之結論。
+
 ## 1. Architecture
 
 | 項目 | 值 |
@@ -13,19 +15,24 @@ v6 機制: RAD-Cascade (active dim + SIGN + Global Top-N) + KIVI-V + CETT FFN; A
 | num_pairs | 32 |
 | d_ff | 5632 |
 
-## 2. Calibrated config (v6)
+## 2. Calibrated config (v6.1)
 
 | 參數 | 值 | 說明 |
 |------|---|------|
-| active_dim ratio | 37.5% (24/64) | PPL+1% 上限 (見 §9); 序列級雙檔短序列 25% |
-| top_n | f(S): 8/16/32 | S<128/<256/≥256 |
+| active_dim ratio | **固定 37.5%** (24/64) | 雙檔已刪 (短序列精度餘裕更小); 見 §9 |
+| top_n | f(S): 8/16/32/**64** (S≥1024) | 長 S 加 64 檔 (N sweep §13) |
 | n_Q anchor | 0 | KL 跨 model 冗餘, 廢除 |
 | n_K anchor | 1 | KL max 校準, runtime running-max |
 | Dynamic per-query | 11 (= 12 active pair - 1 K-anchor) | top-K of \|Q\| |
+| dynamic dim 選擇 | **GQA shared-dim** (8 Q head/組, Σ\|Q\| 加總) | GQA 8:1 union 修正 (§14) |
+| selection 輸入 | **量化前 FP16 幅度** | 純比較零成本 (§13) |
 | β (SIGN) | 1.0 | Theorem 1 unbiased |
 | KIVI group size | 32 | KIVI paper default |
+| 全棧位寬 | RoPE INT16 / 定點 softmax / attn_w U16 / V 整數 MAC / mantissa-shift linear | §12 位寬階梯 |
 | CETT τ_CETT | 0.08 | PPL+1% 標準, per-layer ε_i |
-| generation V | top_n 截斷 (SparQ式) | 只讀 top_n V, prefill soft-tail |
+| generation V | top_n 截斷 (SparQ式) | 只讀候選 V (per-KV-head union), prefill soft-tail |
+
+**attention 全棧定案** (RAD shared-dim + 全位寬 + sel_fp16 + N=64): PG-19 nc=50 S=2048 = **12.3087, vs AWQ dense +0.74%** (§13)。
 
 ## 3. AWQ 精度 (真跑, 部署口徑, 4-way)
 
@@ -81,16 +88,10 @@ v6 機制: RAD-Cascade (active dim + SIGN + Global Top-N) + KIVI-V + CETT FFN; A
 | 37.5% | 16 | 10.7562 | +3.64% | 58.6% | ✗ |
 | 25% | 16 | 10.9626 | +5.63% | 70.3% | ✗ |
 
-============================================================
-S=2048 (nc=50), AWQ dense baseline=12.2178, PPL+1%=12.3400
-============================================================
-  active  top_n       PPL  vs base     QK省    守
-   37.5%     32   12.4510   +1.91%   60.5%    X
-     25%     32   12.6292   +3.37%   72.7%    X
-  18.75%     32   12.8952   +5.54%   78.7%    X
-   37.5%     16   12.5613   +2.81%   61.5%    X
-     25%     16   12.8692   +5.33%   73.8%    X
+**結論**: active 越激進 PPL 單調惡化 (37.5→25→18.75%: +2.66→+3.79→+5.26%)。**37.5% 為實際上限**, 更激進不可行。想多省 attention MAC = 犧牲精度, 且 attention MAC 占比小, 不划算。
+(注: S=512 RAD+CETT 合計 +2.66% 高於 S=2048 的 +1.91%, 因短序列 + CETT/RAD 合計; 不分離因不影響「37.5% 是上限」結論。)
 
+⚠ S=2048 sweep 待補。
 
 ## 6. PG-19 K-anchor: runtime running-max vs offline (仍成立)
 
@@ -154,12 +155,45 @@ reg_cett_eps_base     = per-layer ε_i (SRAM 表, τ_CETT=0.08 校準)
 reg_kivi_group        = 32
 ```
 
-## 12. 待補 (pending)
-- AWQ cross-task (ARC-Easy/Challenge, PIQA 的 AWQ 版; v4 FP32 曾測 ARC-E 0.00 / ARC-C 1.67 / PIQA -0.27pp)
-- S=2048 active sweep 後半
-- 真跑 MAC 的 prefill/generation 分 S 完整表
-- generation V top_n 截斷的 PG-19 long-context 驗證
+## 12. 位寬階梯 (AWQ, PG-19 nc=50 S=2048, 累加 ablation)
+| 級 | 配置 | PPL | vs 前級 | 裁決 |
+|----|------|-----|---------|------|
+| L0 | shared-dim base (FP16) | 12.3594 | — | sanity (重現 12.3567 ✓) |
+| L1 | +RoPE INT16 | 12.3588 | -0.01% | **採用** |
+| L2 | +定點 softmax / attn_w U16 | 12.3616 | +0.02% | **採用** (= 部署位寬定案值) |
+| L3 | +A8 qkv/o/gate/up | 12.4287 | +0.54% | 分解 ↓ (死) |
+| L4 | +A8 down | 12.4568 | +0.23% | 死 |
+
+- L3 分解 (各單獨 vs L2): qkv **+0.35%** / o -0.04% / gate+up +0.10% (近加性)。混合 (qkv FP16, 其餘 A8) +0.42% 超門檻且零硬體收益 → A8 全砍 (見 spec dead directions)。
+- qkv 獨大: A8 擾動投影輸出 → 與 RAD 選擇交互, 非 linear 本身誤差。
+
+## 13. selection FP16 + top-N sweep (AWQ, PG-19 nc=50 S=2048, 基準 L2=12.3616)
+| 配置 | PPL | vs L2 | vs AWQ dense | L10 V union |
+|------|-----|-------|--------------|-------------|
+| sel_fp16, N=32 | 12.3581 | -0.03% | +1.15% | 70.2 |
+| sel_fp16, N=48 | 12.3268 | -0.28% | +0.89% | 104.4 |
+| **sel_fp16, N=64 (採用)** | **12.3087** | **-0.43%** | **+0.74%** | 137.8 |
+
+- sel_fp16 (選擇輸入量化前 FP16): 零硬體成本 (純比較), 白賺。
+- N 邊際遞減 (32→48 -0.25pp, 48→64 -0.15pp) → 停 64, 不試 96。
+- **attention 全棧 vs AWQ dense = +0.74% < 1%** ✓
+
+## 14. GQA shared selection (union counter, L10, GQA 8:1)
+| 量測 | 值 | 結論 |
+|------|---|------|
+| K active-pair union (8 head, per-head 選) | 82.0% ± 7.0% (獨立上界 97.7%) | per-head 下 K BW 省塌到 18% |
+| shared-dim end-to-end | +0.14% PPL (vs per-head) | **採用**: K BW 省回 62.5% dim-level, 代價 noise floor |
+| shared top-N (N_g=32) | +4.02% PPL (vs shared-dim only) | **死**: 8 head 候選本質分歧 |
+| V token union (per-head top_n=32) | 77.5 ± 10.4 tok (上界 256) | V 讀取按 union: 省 92.0% |
+
+- **非對稱 insight**: dim 重要性結構性共享 (shared 幾乎無損); token 重要性 head-specific (shared top-N 死)。
+- GQA 8:1 (TinyLlama) 為最壞 union 情況, 3B (3:1) union 較輕 (見 llama3b_data.md)。
+
+## 15. 待補 (pending)
+- AWQ cross-task (ARC-Easy/Challenge, PIQA 的 AWQ 版)
 - CETT 向量和範數 (TDA Eq.20) 嚴格版 vs 標量近似 (TinyLlama 差<2%, 已知可忽略)
+- 43.6% sparsity 以 per-group INT8 範數重驗 (口徑對齊 3B, 預期無變)
+- XSum L4 shared-dim 併入口徑
 
 ---
 
