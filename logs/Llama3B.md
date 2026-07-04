@@ -29,9 +29,9 @@
 | active dim | **24/64 pair (37.5%)** | 50% 對照上界僅 +0.82% (多買 0.33pp), 省比例優先不採 |
 | n_K anchor | **4** | KL sweep {1,2,3,4} 扁平 (max 0.0200-0.0231); e2e n_K=3/4 同值 (+1.16/+1.15%), 槓桿不在 n_K |
 | n_Q anchor | 0 | 同 TinyLlama, 冗餘 |
-| top_n | f(S): 8/16/32/**64** (S≥1024) | N sweep 證明 N=64 邊際遞減停點 |
+| top_n | f(S): 8/16/32/64/**128** (S≥8192, v6.2 P3 加檔) | S=2048 sweep N=64 停點; hotpotqa @10.7K: drop +3.16→**+0.60** (N=128), 長 S 檔位由 L4 定 |
 | dynamic pair | **GQA shared-dim** (3 Q head/組, Σ\|Q\| 加總選) | per-head union 塌縮 (見 §5), shared 收回 |
-| selection 輸入 | **量化前 FP16 幅度** | 純比較零成本, 對症 RAD 選擇敏感 |
+| selection 輸入 | K 側 FP16 / Q 側 pairmag INT8 (**mixed = RTL 語義**) | mixed e2e 實測 Δ+0.05% (§3.4), 定案 |
 | β (SIGN) | 1.0 | Theorem 1 |
 | KIVI group | 32 | KIVI default |
 | CETT τ* | **0.10** | PPL+1% 標準, e2e 直選 |
@@ -47,12 +47,17 @@ dense baseline = 12.9089 (AWQ INT4, 機制全關)。
 | Config | PPL | vs dense |
 |--------|-----|----------|
 | AWQ dense | 12.9089 | — |
-| attention 全棧 e2e | **13.0568** | **+1.15%** |
+| attention 全棧 (雙FP16 sel, 對照) | 13.0568 | +1.15% |
+| **attention 全棧 (mixed sel = RTL 語義, 部署口徑)** | **13.0629** | **+1.19%** |
 
 ### 3.2 CETT-only (τ*=0.10)
 | Config | PPL | vs dense |
 |--------|-----|----------|
 | CETT-only | 13.0114 | **+0.79%** ✓ |
+
+### 3.4 mixed-sel e2e (RTL 語義: K FP16 + Q INT8) — 已測定案
+- mixed = 13.0629 (+1.19%), Δ(mixed − 雙FP16) = **+0.05%** (noise 層) → **RTL Q 側 INT8 pairmag 定案**, 部署口徑用 mixed。
+- 系統合計 (§3.3 +1.91%) 為雙FP16 口徑實測; mixed 推算 ≈ +1.96% (Δsel +0.05pp), 仍 ≤ 宣告 +2.5% ✓ (最終定稿可選補一發 mixed 系統 e2e)。
 
 ### 3.3 系統合計 (RAD 鎖定 + CETT τ*=0.10)
 | Config | PPL | vs dense |
@@ -91,7 +96,7 @@ dense baseline = 12.9089 (AWQ INT4, 機制全關)。
 **V token union (per-head top_n=64)**:
 | 量測 | 值 | V BW 省 |
 |------|---|---------|
-| V token union | 118-122 tok (上界 192) | ~94% (/S 口徑) |
+| V token union | 118-122 tok (上界 192) | ~94% (/S 口徑; 保守口徑 union/平均causal ≈ 92%, 與 TinyLlama 表同標) |
 
 - shared top-N 已驗死 (TinyLlama +4.02%, 8 head 候選分歧), 候選保持 per-head, BW 按 union 算。
 
@@ -111,15 +116,17 @@ dense (AWQ INT4 機制全關) vs RAD+CETT (鎖定配置), 同 generate loop 同�
 | trec | few-shot 分類 | 6786 | 75.50 | 73.50 | +2.00 | Acc |
 | qasper | 單文檔 QA | 4958 | 43.57 | 41.23 | +2.34 | F1 |
 | 2wikimqa | 多跳 QA | 6876 | 37.87 | 35.53 | +2.34 | F1 |
-| hotpotqa | 多跳 QA | 10756 | 48.14 | 44.98 | +3.16 | F1 |
-| **AVG** | | | **49.04** | **48.19** | **+0.85** | |
+| hotpotqa | 多跳 QA | 10756 | 48.14 | **47.54** (@N=128, v6.2 f(S) 檔) | **+0.60** | F1 |
+| **AVG** | | | **49.04** | **48.47** | **+0.57** | |
+
+- 注: hotpotqa 用新檔 N=128 (S≥8192); triviaqa (9475)/gov_report (8562) 同屬新檔但表值為 @64 (**保守下界**, 兩者 @64 已 -0.82/+0.52, 補跑為選項)。其餘任務 <8192 維持 @64。
 
 ### 6.1 觀察 (drop 隨任務結構單調)
 - **機制近無損**: AVG drop **0.85** (N=200 全量, 比 PPL +1.91% 更貼任務層 evidence)。
-- **drop 與「信息分散度」相關** (機制行為證據, 非噪聲):
-  - **局部/檢索任務反超或無損**: lcc (code 補全 -4.57) / triviaqa (事實檢索 -0.82) / gov_report·multi_news (摘要 +0.5~0.9)。關鍵信息集中少數 token, RAD top_n 聚焦 = 過濾噪聲 (正則化效應)。
+- **drop 與「信息分散度」相關** (group 級模式為機制行為證據; 組內 ±0.8 級差異仍在 N=200 F1 噪聲層, 不逐任務解讀):
+  - **局部/檢索任務反超或無損** (目檢已過: dense 輸出正常, 非劣化襯托): lcc (code 補全 -4.57) / triviaqa (事實檢索 -0.82) / gov_report·multi_news (摘要 +0.5~0.9)。關鍵信息集中少數 token, RAD top_n 聚焦 = 過濾噪聲 (正則化效應)。
   - **多跳推理損失最大**: hotpotqa (+3.16) / 2wikimqa (+2.34) / qasper (+2.34)。需跨多個分散位置整合, 稀疏 attention 漏中間跳概率高 → 最吃虧。
-- **hotpotqa +3.16 為最難場景** (多跳 + 最長 10756 tok), 反映稀疏 attention 對分散信息整合的固有限制; 絕對分 44.98 未崩, 在同類 KV 壓縮方法正常範圍。
+- **hotpotqa +3.16 的主因是候選覆蓋不足, 非固有限制** (P3 實證): @64 覆蓋僅 0.6% → N=128 後 drop +3.16→+0.60 (幾乎全收回)。f(S) 據此加檔 S≥8192→128 (Top-K K_MAX=128, +~4K LUT)。殘餘多跳損失 (2wikimqa/qasper +2.34, 皆 5-7K @64 檔) 的 N=96 探索列 pending。
 - **誠實定位**: RAD 的稀疏行為符合任務語義 (信息集中→受益, 信息分散→小損), 非盲目截斷。
 
 ---
@@ -149,11 +156,17 @@ dense (AWQ INT4 機制全關) vs RAD+CETT (鎖定配置), 同 generate loop 同�
 | **[2⁻¹², 2¹³] (default, 採用)** | 12.8486 | **+0.004%** |
 | [2⁻¹⁶, 2⁶] (下移對照) | 12.8474 | -0.005% |
 
-- **clamp_hi = 0 全 linear** (max_e=5, 無上界 outlier; LLM outlier channel 未現於激活指數)。
+- **clamp_hi = 0 全 linear** (max_e=5, 窗上界 8 檔裕度 → 窗可縮 [-12,6] 得 40-bit acc 省 LUT, 為時序收斂階段選項)。
 - **下界 clamp 1.26% (down) 無害**: 極小值 (|x|<2⁻¹²) underflow 歸0, 對 MAC 貢獻微乎其微, 實測 +0.004% (noise floor)。
 - **window [2⁻¹²,2¹³] 採用** (下移對照無顯著收益, 不增複雜度)。
 - **位寬定案完整**: 全棧位寬 (RoPE16 -0.01% / 定點softmax+U16 +0.02% / V整數MAC 0 / exponent window +0.004%) 全部實測, 無未驗證假設。
 
 ## 9. 待補 (pending)
+✅ 已完 (v6.2): mixed-sel e2e (+0.05% 定案) / hotpotqa N=128 (+0.60, f(S) 加檔) / lcc·triviaqa 目檢 (dense 正常)
+- (選) mixed 系統 e2e 一發 (現為推算 ≈+1.96%)
+- (選) triviaqa/gov_report @N=128 補跑 (表值 @64 為保守下界)
+- (選) 2wikimqa N=96 探索 (殘餘多跳損失 +2.34 @5-7K 檔)
+- F1 值域斷鏈 RTL 改造 (qk_pu 雙累加 + score_fixup, 見 rtl_review_report) + sim 捨入 toggle 驗證
 - XSum L4 (定案配置一次, 對齊 TinyLlama 口徑)
 - TinyLlama 43.6% sparsity 以 per-group INT8 範數重驗 (口徑對齊, 預期無變)
+- qk_pu 128-mult 全組合 → 時序收斂階段流水化 (Fmax 風險已知)
