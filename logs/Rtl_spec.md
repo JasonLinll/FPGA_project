@@ -96,3 +96,6 @@
   **DDR** (KV_ddr 子系統, 全模型 28L×8KV)。s_k side-plane 兩 profile 皆常駐片上。
 - rope_unit 同時服務 Q 路 (檔名歸 KV_frontend 係按 K 管線主用途)。
 - k_quant_unit v1 (單 buffer) 為 spec dead, 未收錄 (v2 的 bit-exact 對照基準僅存 tb)。
+
+缺件 (RTL 不存在)
+件說明Q 前端q_quant (INT8 + s_q) + rope→quant→pairmag→Q bank 管線；現在 Q bank 是 TB 灌的RMSNorm + residualtransformer block 必需，完全沒碰CETT FFN 整條up/gate GEMV→act→CETT 閾值跳過→down；linear_engine 可重用，CETT 選擇邏輯與 W_down_norm 讀排程沒有weight fetch 排程AWQ INT4 權重 DDR→linear_engine 的流 + 雙緩衝；addr_gen 只有 W_DOWN 位址layer sequencer28 層輪替、per-layer base 換頁、chunk 邊界控制s_k 片上 RAM (獨立)DDR profile 需獨立 BRAM 模組 (寫口接 k_pipeline)；現在只活在 k_cache 內AXI4 真 shimDDR 模型是抽象 1req=1row；真 AR/R/AW/W/B burst master + Zynq DDRC QoS 設定prefill tile 引擎tile 化 QK^T (URAM-bound)；現有件全 decode 導向SCALE_MUL CSRsoftmax 常數目前是 elaboration 參數，部署要 per-row s_q runtime 寫
