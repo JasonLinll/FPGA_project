@@ -32,7 +32,8 @@
 | `kv_ddr_writer` | Kv_ddr_writer.v | 寫側 packer (多 head): K_row/V 直寫 burst；K_dim/K_sign 走 per-head write-combine staging (T_BLK=64→64B/dim=1 burst)；staging 尾巴讀口 (stage1 因果縫接)；flush_tail 逐 head 掃 |
 | `kv_gather_top` | Kv_gather_top.v | 單 index stream 批次頂層: 一份 list + 一套 FSM/DMA，K/V 分 phase (`go_k`/`go_v`)；V_SC 5B/group 拆欄 |
 | `kv_rd_sched` | Kv_rd_sched.v | 讀側 per-head 輪詢: 灌 list → go_k → consume_k_done → go_v → consume_v_done → 下一 head；空 head 跳過 |
-| `kv_req_bridge` | Kv_req_bridge.v | attn_score_core 串流 req ↔ gather 批次橋: FIFO + chunk session (16)；head 一致性檔 + head-switch flush；s_k sync-BRAM 配對 |
+| `kv_req_bridge` (v3) | Kv_req_bridge.v | attn_score_core 串流 req ↔ gather 批次橋: S1 走 kdim_prefetch 本地合成 (pf_enable=1) / S2F 走 FIFO+chunk 真 row；per-entry KV head (cfg_kv_head, req_head 是 GQA Q-slot 不可定址)；sk mux 跟回應源；pf_enable=0 = v1 |
+| `kdim_prefetch` | kdim_prefetch.v | 定案 (a) stage1 Active-K 預填: pair_mask → K_DIM/K_SIGN 條帶 session (idx 即位址) → dim-slot banks → 1-cycle 合成 row (active←真值, dropped←sign±1)；3Q 共用一次 fill |
 | `gqa_union` | Gqa_union.v | GQA 3:1 查詢側歸屬: 3 Q-head Top-N → 去重 union (bitmap+epoch, 回卷掃清) + mask 查詢 + qpos 映射；drain 直驅 kv_rd_sched |
 
 ## 4. RAD_attn.v — RAD 注意力核心 (原樣未動)
@@ -51,7 +52,8 @@
 | 模組 | 來源 | 角色 |
 |---|---|---|
 | `softmax_unit` | softmax.v | 定點 base-2 softmax: SCALE_MUL **runtime 校準** (摺 s_q 與 F_S；Q.6 值域→522/64≈8)，FP16 aw (mant=0 精確標記 aw=0) |
-| `attn_chain_top` | Attn_chain_top.v | decode 消費鏈頂層 (片上 profile): score core ↔ k_cache portC 橋 (+Q bank) → softmax → **aw≠0 過濾** V feeder → v_engine；consume_k/v_done 脈衝 (kv_rd_sched 口徑) |
+| `attn_chain_top` | Attn_chain_top.v | decode 消費鏈頂層 (**片上 profile**): score core ↔ k_cache portC 橋 (+Q bank) → softmax → **aw≠0 過濾** V feeder → v_engine；consume_k/v_done 脈衝 (kv_rd_sched 口徑) |
+| `attn_chain_ddr_top` | attn_chain_ddr.v | decode 消費鏈頂層 (**DDR profile**): K 路 = kdim_prefetch+bridge+gather#K (3 DDR master, AXI interconnect 假設)；V 路 = awb list → gather#V go_v → v_engine；attn_out 與片上版 **bit-exact** (tb_attn_chain_ddr 雙 profile 對拍) |
 
 ## 6. gemv_engine.v — GEMV / attn·V 引擎 (原樣未動)
 
@@ -89,6 +91,8 @@
 | tb_integ_vchain | KV_frontend.v KV_cache.v gemv_engine.v |
 | tb_kv_gather / tb_kv_ddr_writer / tb_kv_writer_mh / tb_kv_rd_sched / tb_gqa_union / tb_kv_req_bridge | KV_ddr.v |
 | tb_attn_chain | attn_chain.v RAD_attn.v gemv_engine.v KV_cache.v KV_frontend.v |
+| tb_stage1_equiv | KV_ddr.v RAD_attn.v |
+| tb_attn_chain_ddr | attn_chain.v KV_ddr.v RAD_attn.v gemv_engine.v KV_cache.v |
 
 ## 備註
 
