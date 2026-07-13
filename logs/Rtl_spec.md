@@ -106,8 +106,6 @@
 
 | 件 (Component) | 說明 (Description) |
 | :--- | :--- |
-| **Q 前端** | q_quant (INT8 + s_q) + rope → quant → pairmag → Q bank 管線；現在 Q bank 是 TB 灌的 |
-| **RMSNorm + residual** | transformer block 必需，完全沒碰 |
 | **CETT FFN** | 整條 up/gate GEMV → act → CETT 閾值跳過 → down；linear_engine 可重用，CETT 選擇邏輯與 W_down_norm 讀排程沒有 |
 | **weight fetch 排程** | AWQ INT4 權重 DDR → linear_engine 的流 + 雙緩衝；addr_gen 只有 W_DOWN 位址 |
 | **layer sequencer** | 28 層輪替、per-layer base 換頁、chunk 邊界控制 |
