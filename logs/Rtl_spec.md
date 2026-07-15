@@ -1,11 +1,12 @@
-# RTL 檔案結構 Spec (整併版, 6 檔)
+# RTL 檔案結構 Spec (整併版, 7 檔)
 
 整併原則: **零改碼** — 各來源檔逐字保留為段落 (含各自 header/timescale)，僅加檔頭與
-`// ===== 來源: xxx.v =====` 分隔。行尾正規化為 LF。模組名全域唯一，六檔可聯編。
+`// ===== 來源: xxx.v =====` 分隔。行尾正規化為 LF。模組名全域唯一，七檔可聯編。
 
 > **本版異動 (decode attention 整合輪)**
 > - C2 (softmax runtime scale) / C3 (stage1 因果縫接) 定案並驗證。
 > - 新增 4 件並驗證: `ktail_shadow` / `sk_ram` (→ KV_ddr.v)、`k_feeder` / `krunmax_bank` (→ KV_frontend.v)。
+> - **補登 3 個既存但漏列的模組**: `q_frontend` (→ KV_frontend.v)、`rsqrt_seed_nr` / `rmsnorm_unit` (→ 新增 rmsnorm.v 第 7 檔)。
 > - 缺件表移除「s_k 片上 RAM」「SCALE_MUL CSR」(已補齊)。
 > - `softmax_unit` 由 elaboration 常數 scale 改為 runtime mant+exp bank (見 §5)。
 
@@ -23,6 +24,7 @@
 | `v_quant_unit` | V_quant_unit.v | V per-token KIVI INT4 (G=32): min/max 掃 → 15/range 倒數路 → vq/m_s/e_s/m_q412；range==0 合法路；s 分解走全精度 range×4369 再 LZD |
 | **`k_feeder`** ✨ | k_feeder.v | **K 前端 vec→RoPE 拆流** (C1 缺件補齊)。整向量 pulse 鎖存 → 1 pair/cycle 拆流 → rope_lut_gen+rope_unit → k_pipeline_top 直插。協議與 q_frontend 前段同構 (REQ→WT 非重疊)。註: Rtl_spec 舊稱 k_pipeline_top「含 rope」實則其輸入為 RoPE 後 Q.16 逐對流, k_feeder 補上游 |
 | **`krunmax_bank`** ✨ | krunmax_bank.v | **per-KV-head K running-max 儲存** (多 head decode)。吃 k_pipeline_top pair_mag 匯出口; RMW 2 段流水 (含 write-forward 防同址冒險) + per-head load-to-flat + clear 全掃。HKV×P×15b ≈ 1 BRAM。取代 k_pipeline_top 單 head runmax_reg 的多 head 混值 |
+| **`q_frontend`** ✨補登 | q_frontend.v | **Q 前端** (per GQA 組)。linear_engine out_flat Q 向量 → ① 拆對 rope → ② k_quant_unit_v2 **零改動重用** (INT8 absmax/128, pair_abs 懸空) → ③ q_int8 → Q bank 寫脈衝 (attn_chain_* q_wr 口徑) → ④ q_pairmag_unit 餵 beat (組首/尾) → pairmag_flat (RAD dyn 選擇) → ⑤ s_q → SM 值 (mant+exp 正規化, SM_C=33434=log2e/√128 摺算; SFS=12 記帳差由 attn_chain SM bank 寫入時 exp-12 摺)。Q 側對等於 K 路 k_feeder (rope_unit 共用)。例化 RAD_attn 的 q_pairmag_unit → 聯編需 RAD_attn.v |
 
 ## 2. KV_cache.v — 片上 KV 儲存子系統 (demo profile)
 
@@ -75,15 +77,30 @@
 | `v_engine` | attn·V: Σ(aw·s)·Vq + Σaw·m 係數摺疊，Q3.20 輸出 |
 | `fp_normalize` | Q3.20 → FP16 |
 
+## 7. rmsnorm.v — RMSNorm 前置級 ✨補登
+
+| 模組 | 來源 | 角色 |
+|---|---|---|
+| `rsqrt_seed_nr` | rmsnorm.v | 倒數平方根 1/√S: LZD + seed LUT (64 entry) + 1 次 Newton-Raphson。start 後 4 拍 done, 輸出 m_r (Q2.16, ∈(0.5,2]) + e_r。奇 k 摺一位; r=√N·y1·2^(-k'/2) (√N 摺常數 SQN, N 免除法)。**Rule 2: 無除法器** |
+| `rmsnorm_unit` | rmsnorm.v | 兩 pass 串流: Σx² → rsqrt → 逐元素 x·w·r 正規化。輸出口徑 = linear_engine L1 活化輸入 (per-element mx Q1.10 hidden-1 / ex s6 / x_sign), RMSNorm 後直餵 QKV/FFN GEMV, 免 INT8 量化 pass (r 為公因子, 只進指數/尾數正規化不進碼值)。精度 FP11 (2^-11) ≫ NR 誤差 |
+
+> **歸屬**: GEMV 上游前置級 — 不屬 KV 前端 (非量化/RoPE) 亦不屬 gemv_engine (非純算子)。
+> linear_engine 的活化輸入源, 自成子系統。
+
 ---
 
 ## 資料流 (decode step)
 
 ```
+[rmsnorm] RMSNorm → [gemv_engine] linear_engine (QKV proj) ─┬→ [KV_frontend] q_frontend (Q 路)
+                                                             ├→ [KV_frontend] k_feeder (K 路)
+                                                             └→ [KV_frontend] v_quant (V 路)
+
 [KV_frontend]  k_feeder(vec→rope) → k_pipeline(rope→k_quant) ─┬→ [KV_cache] k_cache      (片上 profile)
                                      │                        └→ [KV_ddr]   kv_ddr_writer (DDR profile)
                                      ├→ pair_mag → [KV_frontend] krunmax_bank (per-head runmax)
                                      └→ s_k ─────→ [KV_ddr] sk_ram (DDR profile 片上 side-plane)
+[KV_frontend]  q_frontend → Q bank + pairmag (RAD dyn) + SM 值 (→ attn_chain SM bank)
 [gemv_engine]  linear_engine → [KV_frontend] v_quant ─┬→ v_cache / kv_ddr_writer
 
 [RAD_attn] attn_score_core ──req──> k_cache portC (片上)
@@ -112,13 +129,15 @@
 | tb_attn_chain | attn_chain.v RAD_attn.v gemv_engine.v KV_cache.v KV_frontend.v | 需回歸 (SM bank; 不寫 bank = legacy bit-exact) |
 | tb_stage1_equiv | KV_ddr.v RAD_attn.v | |
 | tb_attn_chain_ddr | attn_chain.v KV_ddr.v RAD_attn.v gemv_engine.v KV_cache.v | 需回歸 (ddr_top 補 shadow tie 8 腳 + sq_valid=0 等 4 腳) |
+| tb_q_frontend | KV_frontend.v RAD_attn.v | 既存 (q_frontend 例化 q_pairmag_unit → 需 RAD_attn.v) |
+| tb_rmsnorm | rmsnorm.v | 既存 |
 
 ## 備註
 
 - 兩個部署 profile 並存: **片上** (KV_cache 直讀, demo S=2048 單層單 head) 與
   **DDR** (KV_ddr 子系統, 全模型 28L×8KV)。s_k side-plane 兩 profile 皆常駐片上
   (片上走 k_cache 隨行 / DDR 走 sk_ram 獨立)。
-- rope_unit 同時服務 Q 路與 K 路 (k_feeder / q_frontend 皆例化)。
+- rope_unit 同時服務 Q 路與 K 路 (q_frontend / k_feeder 皆例化; 檔名歸 KV_frontend 係按 K 管線主用途)。
 - k_quant_unit v1 (單 buffer) 為 spec dead, 未收錄 (v2 的 bit-exact 對照基準僅存 tb)。
 - **RoPE LUT 資料** (theta base=500000 / cos / sin, Q1.15) 由 TB 層次自算或部署 init 引擎載入;
   rope_lut_gen 無自初始化。tb_k_feeder 內建自算 + 假通過防護 (全 0 表 FATAL)。
