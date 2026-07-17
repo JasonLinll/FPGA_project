@@ -1,12 +1,14 @@
-# RTL 檔案結構 Spec (整併版, 7 檔)
+# RTL 檔案結構 Spec (整併版, 8 檔)
 
 整併原則: **零改碼** — 各來源檔逐字保留為段落 (含各自 header/timescale)，僅加檔頭與
-`// ===== 來源: xxx.v =====` 分隔。行尾正規化為 LF。模組名全域唯一，七檔可聯編。
+`// ===== 來源: xxx.v =====` 分隔。行尾正規化為 LF。模組名全域唯一，八檔可聯編。
 
 > **本版異動 (decode attention 整合輪)**
 > - C2 (softmax runtime scale) / C3 (stage1 因果縫接) 定案並驗證。
 > - 新增 4 件並驗證: `ktail_shadow` / `sk_ram` (→ KV_ddr.v)、`k_feeder` / `krunmax_bank` (→ KV_frontend.v)。
 > - **補登 3 個既存但漏列的模組**: `q_frontend` (→ KV_frontend.v)、`rsqrt_seed_nr` / `rmsnorm_unit` (→ 新增 rmsnorm.v 第 7 檔)。
+> - **decode 序列器完成並驗證**: `decode_attn_top` (→ 新增 decode_top.v 第 8 檔),
+>   參考鏈對拍 3 tok × 8 head × 3Q 全 bit-exact。缺件表移除。
 > - 缺件表移除「s_k 片上 RAM」「SCALE_MUL CSR」(已補齊)。
 > - `softmax_unit` 由 elaboration 常數 scale 改為 runtime mant+exp bank (見 §5)。
 
@@ -43,7 +45,7 @@
 | `kv_gather_top` | Kv_gather_top.v | 單 index stream 批次頂層: 一份 list + 一套 FSM/DMA，K/V 分 phase (`go_k`/`go_v`)；V_SC 5B/group 拆欄 |
 | `kv_rd_sched` | Kv_rd_sched.v | 讀側 per-head 輪詢: 灌 list → go_k → consume_k_done → go_v → consume_v_done → 下一 head；空 head 跳過 |
 | `kv_req_bridge` (v3) | Kv_req_bridge.v | attn_score_core 串流 req ↔ gather 批次橋: S1 走 kdim_prefetch 本地合成 (pf_enable=1) / S2F 走 FIFO+chunk 真 row；per-entry KV head (cfg_kv_head, req_head 是 GQA Q-slot 不可定址)；sk mux 跟回應源；pf_enable=0 = v1 |
-| `kdim_prefetch` | kdim_prefetch.v | 定案 (a) stage1 Active-K 預填: pair_mask → K_DIM/K_SIGN 條帶 session (idx 即位址) → dim-slot banks → 1-cycle 合成 row (active←真值, dropped←sign±1)；3Q 共用一次 fill。**A_MAXP 上限由頂層參數化 (attn_chain_ddr_top 設 32)**。**B 重構 (上板可綜合化)**: 原 2D [slot][token] 讀側 64-lane runtime crossbar 掛存儲 → 無法推斷 BRAM。改 ① act = 64 dim-slot bank ×(S_MAX/8)×64b BRAM36 TDP (填充雙口寫 8c/回應 = AXI 128B/8beat 下限; 服務 port-B 讀); ② 讀 1-cycle 契約以**順序預讀**維持 (S1 全掃 t 嚴格順序/回捲 0, 服務當拍組合預發 word(t+1), 回捲由 F_PRIME 鎖存 word0 靜態 reg 接; 非順序 srv_t=FATAL); ③ sgn = 128 slot bank LUTRAM 異步讀; ④ gather 無背壓 → 回應 FIFO(32)+drain FSM; ⑤ crossbar 移 LUT 域 (~10-15K LUT, Fmax 不收可 +1 級 pipeline, sk 對齊需同步)。介面/bit-exact 行為不變 (tb_ktail_shadow 10/10 含 3-scan 回捲) |
+| `kdim_prefetch` | kdim_prefetch.v | 定案 (a) stage1 Active-K 預填: pair_mask → K_DIM/K_SIGN 條帶 session (idx 即位址) → dim-slot banks → 1-cycle 合成 row (active←真值, dropped←sign±1)；3Q 共用一次 fill。**A_MAXP 上限由頂層參數化 (attn_chain_ddr_top 設 32)**。**B 重構 (上板可綜合化)**: 原 2D [slot][token] 讀側 64-lane runtime crossbar 掛存儲 → 無法推斷 BRAM。改 ① act = 64 dim-slot bank ×(S_MAX/8)×64b BRAM36 TDP (填充雙口寫 8c/回應 = AXI 128B/8beat 下限; 服務 port-B 讀); ② 讀 1-cycle 契約以**順序預讀**維持 (S1 全掃 t 嚴格順序/回捲 0, 服務當拍組合預發 word(t+1), 回捲由 F_PRIME 鎖存 word0 靜態 reg 接; 非順序 srv_t=FATAL); ③ sgn = 128 slot bank LUTRAM 異步讀; ④ gather 無背壓 → 回應 FIFO(32)+drain FSM; ⑤ crossbar 移 LUT 域 (~10-15K LUT, Fmax 不收可 +1 級 pipeline, sk 對齊需同步)。介面/bit-exact 行為不變 (10/10 含 3-scan 回捲 + **追趕查詢**: tb gate 模擬 bridge s1_gate, 查詢貼水位競速 fill)。**B 追趕 (fill‖scan 重疊)**: ① session 對調 sign 先行; ② act 每 seg 一 session (gf_n=n_slots, ptr 即 slot, cur_seg 常數 — **零 runtime 除法**), FIFO 帶 5b seg 標籤; ③ `pf_wmark` 水位口 (session 落地計數推進, 夾 s_len), ready 早開 (sign 全落+session0); ④ zero_w 改 drain 寫 word0 時捕獲 (prime 讀機構全刪); ⑤ 預讀只在字界 (t%8==7) 發, drain 當拍讓路 (≤1/8 拍); ⑥ bridge 加 `s1_gate` 1 埠: req_ready ∧ ((t<wmark)∨(t≥stg_base)) — **請求側 gate, 1-cycle srv 契約與 sk 對齊零改**。掃描藏進 fill, S=2048 解析省 ~min(scan,fill)≈2K/head |
 | `gqa_union` | Gqa_union.v | GQA 3:1 查詢側歸屬: 3 Q-head Top-N → 去重 union (bitmap+epoch, 回卷掃清) + mask 查詢 + qpos 映射；drain 直驅 kv_rd_sched |
 | **`ktail_shadow`** ✨ | ktail_shadow.v | **staging 尾巴 K row 影子** (C3 stage1 因果縫接)。decode 當前 token 的 K 尚在 writer staging 未落 DDR → 攔 bridge→prefetch 的 srv 流, 窗口內 (t∈[stg_base, stg_base+stg_cnt)) 由片上鏡射 1-cycle 合成 (prefetch 同式), 窗口外透傳。0 額外 cycle。寫側同拍鏡射整 row (int8+sign), HKV×T_BLK ≈ 2 URAM。索引 = n_tok_k_flat[head] mod T_BLK (writer 單一真值源) |
 | **`sk_ram`** ✨ | sk_ram.v | **s_k side-plane 片上 BRAM** (DDR profile 專用)。缺件補齊: 片上 profile s_k 活在 k_cache 內, DDR profile 需獨立常駐片上模組。寫口 = K 路 tok_valid 拍 ({mant[15:5], exp} 縮位約定同 k_cache); 讀口 = bridge sk_req/sk_idx (1-cycle sync)。HKV×S_MAX×17b ≈ 8 BRAM36 |
@@ -87,6 +89,18 @@
 > **歸屬**: GEMV 上游前置級 — 不屬 KV 前端 (非量化/RoPE) 亦不屬 gemv_engine (非純算子)。
 > linear_engine 的活化輸入源, 自成子系統。
 
+## 8. decode_top.v — decode step 序列器 ✨
+
+| 模組 | 來源 | 角色 |
+|---|---|---|
+| `decode_attn_top` | decode_top.v | **decode step 收口頂層**: 24 Q + 8 K + 8 V 向量 (linear out_flat 口徑, 拉取式握手, head 序固定) → 8 KV-head 組**全序列** (D1a 正確性優先) → 24 attn_out (Q3.20×D)。每組: 3×q_frontend(Q bank/SM bank/pairmag 組累加) → k_feeder+k_pipeline(→writer+shadow 鏡射 / sk_ram / krunmax_bank) → v_quant→writer → **fence** (writer idle = shadow B3 靜止窗口) → krunmax load → step_start (g_q=3) → attn_qhead=3g+slot。**top_n 鉗位 min(top_n,s_len)** (短序列不留 Top-K 空槽; f(S) 檔位歸 layer sequencer/host)。例化: q_frontend / k_feeder / k_pipeline_top / v_quant_unit / kv_ddr_writer / sk_ram / krunmax_bank / attn_chain_ddr_top。對外 = 3 讀 master + 1 寫 master (AXI 抽象)。守衛: 相位外 tok_valid/out_valid/attn_valid、窗口含當前 token (延一拍檢, g_step 口徑) |
+
+> **驗證 (tb_decode_seq, ALL PASS)**: 序列器不加算術只加編排 → golden = **第二個
+> attn_chain_ddr_top 參考鏈**: bank 寫入層次共接 (資料恆等)、讀同一 DDR 陣列 (版面
+> 零複製)、shadow 鏡射同源、第二 sk_ram 鏡寫; DUT 每組 step 後 TB 扣向量跑 ref step
+> → **3 tok × 8 head × 3Q 逐 bit 對拍全過, 0 WARN 0 FATAL** (15+ 道模組守衛全程靜默)。
+> 一般 case 數值正確性由葉件 TB + tb_attn_chain_ddr 等價傳遞。
+
 ---
 
 ## 資料流 (decode step)
@@ -109,6 +123,7 @@
                                         → [gemv_engine] v_engine → attn_out
 多 head: [KV_ddr] gqa_union (3Q→union) → kv_rd_sched (per-KV-head 輪詢)
          runmax = krunmax_bank load[g]; s_q scale = SM bank[g_q]
+收口:   [decode_top] decode_attn_top 序列上述全部 (per token × 8 head, D1a 全序列)
 ```
 
 ## TB → 檔案對照 (整併後編譯清單)
@@ -131,6 +146,7 @@
 | tb_attn_chain_ddr | attn_chain.v KV_ddr.v RAD_attn.v gemv_engine.v KV_cache.v | 需回歸 (ddr_top 補 shadow tie 8 腳 + sq_valid=0 等 4 腳) |
 | tb_q_frontend | KV_frontend.v RAD_attn.v | 既存 (q_frontend 例化 q_pairmag_unit → 需 RAD_attn.v) |
 | tb_rmsnorm | rmsnorm.v | 既存 |
+| **tb_decode_seq** ✨ | decode_top.v attn_chain.v KV_ddr.v RAD_attn.v gemv_engine.v KV_cache.v KV_frontend.v | ALL PASS — 參考鏈對拍 24 組全 bit-exact (含 B 追趕雙鏈) |
 
 ## 備註
 
@@ -151,11 +167,10 @@
 
 | 件 (Component) | 說明 (Description) |
 | :--- | :--- |
-| **decode 序列器** | per token × 8 KV-head × (3 Q-head) 頂層縫接: Q/K/V 前端調度 → writer → shadow fence → krunmax load + pairmag 選擇 → step_start → 收 3 attn_out。葉件 (k_feeder/krunmax_bank/sk_ram/SM bank/shadow) 全備並驗, 待收口 |
 | **CETT FFN** | 整條 up/gate GEMV → act → CETT 閾值跳過 → down；linear_engine 可重用，CETT 選擇邏輯與 W_down_norm 讀排程沒有 |
 | **weight fetch 排程** | AWQ INT4 權重 DDR → linear_engine 的流 + 雙緩衝；addr_gen 只有 W_DOWN 位址 |
 | **layer sequencer** | 28 層輪替、per-layer base 換頁、chunk 邊界控制 (含 krunmax_bank clear 的 chunk 邊界觸發) |
 | **AXI4 真 shim** | DDR 模型是抽象 1req=1row；真 AR/R/AW/W/B burst master + Zynq DDRC QoS。ktail_shadow 的 B1 (K_row/V 直寫 fence) 亦歸此件 |
 | **prefill tile 引擎** | tile 化 QK^T (URAM-bound)；現有件全 decode 導向 |
 
-> **已補齊 (從舊缺件表移除)**: ~~s_k 片上 RAM~~ → sk_ram (§3); ~~SCALE_MUL CSR~~ → softmax_unit runtime SM bank (§5)。
+> **已補齊 (從舊缺件表移除)**: ~~s_k 片上 RAM~~ → sk_ram (§3); ~~SCALE_MUL CSR~~ → softmax_unit runtime SM bank (§5); ~~decode 序列器~~ → decode_attn_top (§8)。
