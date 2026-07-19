@@ -24,6 +24,16 @@ GEMV lane，runtime 選擇：
 mode mux 必須位於已寄存的模組邊界，不可把 128K address、384-way candidate 或
 8192-way neuron 判斷合成成大扇入組合 mux。
 
+Union engine 也必須 runtime 切換：
+
+- Short profile（目前 `S<=2048`）：保留 bounded short-mask 枚舉，延遲較低。
+- Long decode：使用 hash union，容量不隨 S 成長。
+
+Hash 每個 candidate 約需 read/check 三拍，另有 table clear；短 S 不一定比
+mask 快。若為省面積只保留 hash，必須明列為面積換延遲。以 384 candidates
+粗估，mask 掃描延遲約在 S 接近 70K 後才可能超過 hash；精確 crossover 以
+合成後 cycle profile 為準。
+
 ### 1.2 長上下文位寬
 
 部署 profile 以 128K context 為上限：
@@ -58,6 +68,16 @@ legacy 頂層目前仍以 `SW=12/S_MAX=2048/K_MAX=64` 作 bit-exact 回歸。長
 此流程中，片上 score/candidate/softmax 容量只跟 `K_MAX` 或 `3*K_MAX` 有關，
 不跟 S 成長。
 
+Top-N canonical ordering 固定為：
+
+1. signed score 較大者優先。
+2. score 相同時 token index 較小者優先。
+
+到達順序不得參與 tie-break。`topk_engine` 使用獨立 `cell_vld`；不能以
+`NEG_INF` 同時表示空槽，否則真實飽和 score=`NEG_INF` 會漏選。
+`Tb_stage1_top128_equiv.v` 是移除 `s1_buf[S]` 前的硬 gate：full-store reference
+先保存全部輸入，再獨立 selection；DUT 為 streaming Top-128。
+
 ### 2.2 Candidate union 與 `map_r`
 
 已實作 `gqa_sparse_union_bram`：
@@ -73,25 +93,46 @@ legacy 頂層目前仍以 `SW=12/S_MAX=2048/K_MAX=64` 作 bit-exact 回歸。長
 - 預設 radix-16，17-bit key 共 5 pass。
 - Histogram/prefix/scatter 均為 sequential RAM 操作。
 - 輸出 `{sorted_key, original_union_slot}`，所以 reorder 不改變 head ownership。
-- 排序改善 DDR row locality；相鄰 key 可在 AXI adapter 擴充 burst coalescing。
+- 排序本身不會減少 AR 數。是否改善 DDR locality 必須用真實 candidate trace
+  驗證，不能由演算法結構推定。
 
-舊 `Attn_chain.v::map_r[0:S_MAX-1]` 是隱藏的 S-linear state。長 context 路徑
-不得綜合它；應由 candidate slot 隨 score/softmax 流傳遞，或使用上述 bounded
-hash map。不能把 `map_r` 單純從 FF 改成 128K asynchronous RAM，因為那仍保留
-容量與讀取時序問題。
+`analyze_candidate_locality.ps1` 接受每行一組逗號分隔 candidate index，輸出
+排序前後平均距離、4-KiB page crossing，以及「若相鄰 row 可 burst」的 AR
+減少率。取得 LongBench 真實 Top-N trace 前，radix scheduler 的效能收益狀態
+為「未證實」；它目前只提供確定性 ordering 與 future coalescer 的前置條件。
+
+舊 `Attn_chain.v::map_r[0:S_MAX-1]` 是隱藏的 S-linear state，現已由
+`bounded_sorted_lookup` 取代。它在最多 384 個嚴格升序 union key 上作 registered
+binary search；沒有 128K asynchronous RAM 或大 CAM。單元 gate 已通過，
+跨 `T_BLK` end-to-end checksum 尚待 ModelSim gate。
 
 ### 2.3 DDR gather 碎讀
 
-Union 最壞 384 個 token，原始 Top-K 順序會造成 random-read 風暴。定案：
+Union 最壞 384 個 token，原始 Top-K 順序可能造成 random-read 風暴。定案：
 
 - 先由 radix scheduler 依 token index 排序。
 - gather 保留至少 16 個 outstanding request 與 tag reorder。
-- DDR page locality 優先；相鄰 token row 由 AXI adapter 合併。
+- 是否有 DDR page locality 收益由真實 trace 決定；相鄰 token row 才可由 AXI
+  adapter 合併。
 - 目前 RTL read master 只有 `ar_addr/ar_tag`，沒有 `ar_len`。因此真正多-beat
   burst coalescing 尚未接線；在新增 `ar_len` 前，不得宣稱已消除碎讀。
 
 Stage1 是順序 dim-plane/tiled stream；random gather 只發生在 bounded stage2/V
 候選，不會成為 O(S) 次 random read。
+
+Burst-capable read contract v2 已固定於 `Axi_read_contract.vh`：
+
+| 訊號 | 契約 |
+|---|---|
+| `ar_len[7:0]` | beats minus one；legacy 單 beat為 0 |
+| `ar_tag` | 一個 burst 一個 tag，直到 `r_last` 前不得重用 |
+| `r_beat[7:0]` | burst 內 zero-based beat |
+| `r_last` | `r_beat==ar_len` 的 handshake |
+| outstanding | 預設 16，且不得超過 `2**TAG_W` |
+| boundary | coalesced burst 不跨 4-KiB |
+
+目前 `gather_fsm` 是 v1，等價 `ar_len=0/r_last=1`。v2 尚未接入，不能因為已有
+radix sorting 就宣稱 DDR AR 數或 burst bandwidth 已改善。
 
 ### 2.4 Softmax
 
@@ -233,11 +274,24 @@ neuron，否則違反演算法。
 | `Tb_long_ctx.v` | PASS | 三頭重複 candidate、union length、key→slot |
 | `Tb_candidate_sched.v` | PASS | radix ordering、payload slot、output stall |
 | `Tb_cett.v` | PASS | threshold equality/drop、pipeline stall、empty group、W_down output hold |
+| `Tb_cett_empty_groups.v` | PASS | 全空、頭空、間隔空、連續空、尾空 |
+| `Tb_stage1_top128_equiv.v` | PASS | full-store vs streaming Top-128、tie 與 `NEG_INF` |
+| `Tb_bounded_lookup.v` | PASS | sorted key 命中、首尾 slot、各類 miss |
 | `Tb_softmax_long.v` | PASS | 128-depth buffer 搭配 128K token key domain |
 | `Tb_prefetch_8192.v` | PASS | S=8192 active/sign/segment address 不截斷 |
 | `Tb_softmax_p2.v` | PASS | sparse/dense `n_f`、key 隨行、backpressure |
 | `Tb_score_ls.v` | PASS（8 cases） | 新 score core 對 frozen gold bit-exact |
 | `Tb_ktail_shadow.v` | PASS（10 cases） | staging window/shadow/prefetch bit-exact |
+
+Streaming Top-128 ModelSim/Icarus 對拍 checksum：
+
+| case | checksum |
+|---|---|
+| tie-heavy-small | `4d53eb9f1839a740` |
+| boundary-8191 | `03661ff416732595` |
+| all-tie-permuted-8192 | `a940f920e23a14a5` |
+| boundary-8193 | `03661ff416732595` |
+| real-neg-inf | `ae91fa89e0f6f7f2` |
 
 `Tb_attn_chain_ddr.v` 在本次 Icarus elaboration/run 超過 240 秒，沒有取得完成
 結果，因此不列 PASS。先前 `Tb_xtblk.v` 的 tok0..67 bit-exact 是 writer/shadow
@@ -247,6 +301,10 @@ neuron，否則違反演算法。
 
 Long-context phase 只有在下列項目全部完成後才可標示 end-to-end：
 
+- 抽換順序固定：`map_r→bounded map`、`cand_mask→sparse list`、
+  `s1_buf→streaming Top-128`；一次只換一件。
+- 每次抽換後重跑跨 `T_BLK=64` 的 `Tb_xtblk`，bit-exact、`cks`、`xbits`
+  都必須與上一 checkpoint 相同。單元 PASS 不等於整合 PASS。
 - legacy `s1_buf/full_buf/cand_mask/map_r` 從 long decode elaboration 移除。
 - `gqa_sparse_union_bram` 與 radix scheduler 接入 score/V gather。
 - `S_MAX/SW/POS_W/TIDX_W/cfg_s/stride` 以 128K profile 一次加寬。
@@ -256,3 +314,21 @@ Long-context phase 只有在下列項目全部完成後才可標示 end-to-end�
 - `S=8191/8192/8193`、`S=131071/131072`、union=384、AXI backpressure、
   hash collision、CETT keep-none/keep-all 皆有 directed test。
 - 完整 `Tb_xtblk` 與 synthesis RAM/DSP/utilization/timing report 通過。
+
+### 6.1 常駐 S-linear 洩漏表
+
+`check_s_linear.ps1` 每次 RTL 修改後執行。出現新的或改名的 S-dependent RAM
+會直接 FAIL，必須先更新本表與架構理由。
+
+| 檔案/陣列 | 現況 | Long profile |
+|---|---|---|
+| `Rad_attn.s1_buf[0:2]` | legacy S-linear | 必須移除 |
+| `Rad_attn.full_buf[0:2]` | legacy S-linear | 改 384-depth slot RAM |
+| `Rad_attn.cand_mask[0:2]` | legacy S-bit | 改 sparse candidate list |
+| `Attn_chain.map_r` | 已移除 | bounded sorted lookup；待跨 T_BLK gate |
+| `Kv_ddr.gqa_union.mram/upos_ram` | legacy S-linear | long path不 elaboration |
+| `Kv_ddr.sk_ram` | `HKV*S` | DDR metadata + tile cache |
+| `Kv_ddr.kdim_prefetch` active/sign banks | depth-derived | rolling tile，不能 128K 全留 |
+| `Kv_cache` K/V arrays | on-chip reference profile | long path不 elaboration |
+
+Testbench 的 full-store reference 可以 S-linear；檢查器只限制可綜合 RTL。
